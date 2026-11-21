@@ -2,7 +2,7 @@
 
 All entries describe reviewed Stable releases. Research measurements and benchmark claims are not copied into this file automatically.
 
-## v1.0
+## v1.1
 
 - Prepared the core Stable distribution from the matching source version.
 - Generated the English package documentation and Stable update policy.
