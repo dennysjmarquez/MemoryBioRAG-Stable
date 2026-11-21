@@ -1,6 +1,6 @@
 # MemoryBioRAG Stable
 
-[![Release](https://img.shields.io/badge/release-v1.1-blue.svg?style=flat-square)](https://github.com/dennysjmarquez/MemoryBioRAG-Stable/releases)
+[![Release](https://img.shields.io/badge/release-v1.2-blue.svg?style=flat-square)](https://github.com/dennysjmarquez/MemoryBioRAG-Stable/releases)
 [![License](https://img.shields.io/badge/license-Apache--2.0-green.svg?style=flat-square)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.11%2B-blue?style=flat-square)](https://python.org)
 [![MCP](https://img.shields.io/badge/protocol-MCP%20stdio-orange?style=flat-square)](https://modelcontextprotocol.io)
