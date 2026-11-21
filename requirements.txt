@@ -1,0 +1,7 @@
+numpy==2.4.6
+pydantic==2.13.5
+nltk==3.9.4
+mcp==1.30.0
+python-dotenv==1.2.3
+fastapi==0.141.1
+uvicorn==0.52.4

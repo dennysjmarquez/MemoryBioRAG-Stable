@@ -1,0 +1,506 @@
+#!/usr/bin/env python3
+"""
+BioRAG Graph Maintenance Daemon — La Hormiguita como servicio
+=============================================================
+Demonio que ejecuta ciclos de mantenimiento del grafo de forma periódica.
+Usa la hormiguita (dmn_reflexion.py) para evaluar y podar sinapsis
+espurias, manteniendo la salud del grafo sin intervención manual.
+
+Características:
+- Lock file para evitar duplicación
+- Intervalo configurable (default 6 horas)
+- Resume automático (usa estado_hormiga.json)
+- Quota awareness (respeta límites de API)
+- Logging a archivo y consola
+- Modo --once para ejecución single-shot
+
+Uso:
+    python3 graph_maintenance_daemon.py              # Daemon continuo (requiere BIORAG_DAEMON_ENABLED=1 o --force)
+    python3 graph_maintenance_daemon.py --once       # Un solo ciclo
+    python3 graph_maintenance_daemon.py --status     # Ver estado actual
+    python3 graph_maintenance_daemon.py --reset      # Resetear estado
+    python3 graph_maintenance_daemon.py --stop       # Detener daemon en ejecución
+
+Variables de entorno:
+    BIORAG_DAEMON_ENABLED          — 0/off (default): desactivado; 1/on: habilitado
+    BIORAG_DAEMON_INTERVALO_HORAS  — Intervalo entre ciclos (default: 6)
+    BIORAG_DAEMON_MAX_NODOS        — Nodos por ciclo (default: 10)
+    BIORAG_DAEMON_LOCK_PATH        — Ruta del lock file (default: .hormiguita.lock)
+    BIORAG_DAEMON_LOG_PATH         — Ruta del log (default: logs/hormiguita.log)
+    BIORAG_DAEMON_LOG_ENABLED      — Logging ON/OFF (default: off = silencio).
+                                     Con 1/true: archivo único hormiguita.log,
+                                     rotación ~1MB x3, TTL 7 días.
+"""
+
+import os
+import sys
+import json
+import time
+import signal
+import logging
+import argparse
+import fcntl
+from datetime import datetime
+
+# Asegurar que el path incluya el directorio actual
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+
+# Cargar .env.local (si existe) para que BIORAG_DAEMON_LOG_ENABLED funcione
+# también cuando se ejecuta el daemon manualmente, no solo al spawn desde MCP.
+try:
+    from dotenv import load_dotenv
+    _root = os.path.dirname(os.path.abspath(__file__))
+    for _cand in (".env.local", ".env"):
+        _p = os.path.join(_root, _cand)
+        if os.path.exists(_p):
+            load_dotenv(_p, override=False)
+            break
+except ImportError:
+    pass
+
+from core.memory_store import SQLiteMemoryBioRAG
+from core.dmn_reflexion import ejecutar_ciclo_reflexivo, _cargar_estado, _guardar_estado
+from core.paths import (
+    resolve_hormiguita_lock_path,
+    resolve_hormiguita_pid_path,
+    resolve_hormiguita_log_dir,
+)
+
+# --- Configuración -----------------------------------------------------------
+
+INTERVALO_HORAS = float(os.environ.get("BIORAG_DAEMON_INTERVALO_HORAS", "1"))
+MAX_NODOS_POR_CICLO = int(os.environ.get("BIORAG_DAEMON_MAX_NODOS", "10"))
+LOCK_PATH = resolve_hormiguita_lock_path()
+PID_PATH = resolve_hormiguita_pid_path()
+LOG_DIR = resolve_hormiguita_log_dir()
+
+# --- Logging -----------------------------------------------------------------
+
+def _limpiar_logs_viejos(log_dir, dias=7):
+    """Borra archivos de log con más de `dias` días (TTL)."""
+    try:
+        import glob
+        cutoff = time.time() - dias * 86400
+        for p in glob.glob(os.path.join(log_dir, "hormiguita.log*")):
+            try:
+                if os.path.getmtime(p) < cutoff:
+                    os.remove(p)
+            except OSError:
+                pass
+    except OSError:
+        pass
+
+
+def configurar_logging(log_dir):
+    """Configura logging según BIORAG_DAEMON_LOG_ENABLED (default: off).
+
+    Off (default): silencio total — no crea archivos, no escribe nada.
+    On (BIORAG_DAEMON_LOG_ENABLED=1/true): un único archivo hormiguita.log
+    con rotación (~1MB x 3 backups) + consola. Limpia logs >7 días al arrancar.
+    """
+    logger = logging.getLogger("Hormiguita.Daemon")
+    logger.handlers.clear()
+
+    flag = os.environ.get("BIORAG_DAEMON_LOG_ENABLED", "").strip().lower()
+    if flag not in ("1", "true", "yes", "on"):
+        logger.addHandler(logging.NullHandler())
+        return logger
+
+    os.makedirs(log_dir, exist_ok=True)
+    _limpiar_logs_viejos(log_dir, dias=7)
+    log_file = os.path.join(log_dir, "hormiguita.log")
+
+    from logging.handlers import RotatingFileHandler
+    handlers = [
+        RotatingFileHandler(
+            log_file, maxBytes=1024 * 1024, backupCount=3, encoding="utf-8"
+        ),
+        logging.StreamHandler(sys.stdout),
+    ]
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+        handlers=handlers,
+    )
+    return logger
+
+
+# --- Lock file ---------------------------------------------------------------
+
+class DaemonLock:
+    """Lock file para evitar que el daemon se ejecute múltiples veces."""
+    
+    def __init__(self, lock_path):
+        self.lock_path = lock_path
+        self.lock_file = None
+    
+    def adquirir(self):
+        """Adquiere el lock. Retorna True si éxito, False si ya está tomado."""
+        try:
+            os.makedirs(os.path.dirname(os.path.abspath(self.lock_path)), exist_ok=True)
+            self.lock_file = open(self.lock_path, "w")
+            fcntl.flock(self.lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.lock_file.write(str(os.getpid()))
+            self.lock_file.flush()
+            return True
+        except (IOError, OSError):
+            return False
+    
+    def liberar(self):
+        """Libera el lock. NO borra el archivo: el flock es sobre el inode,
+        y borrarlo permitiría que una segunda instancia adquiera un lock nuevo
+        sobre un inode distinto (causa raíz del doble daemon)."""
+        if self.lock_file:
+            try:
+                fcntl.flock(self.lock_file, fcntl.LOCK_UN)
+                self.lock_file.close()
+            except (IOError, OSError):
+                pass
+
+
+# --- PID file ----------------------------------------------------------------
+
+def _escribir_pid():
+    """Escribe el PID actual al archivo PID."""
+    try:
+        os.makedirs(os.path.dirname(os.path.abspath(PID_PATH)), exist_ok=True)
+        with open(PID_PATH, "w") as f:
+            f.write(str(os.getpid()))
+    except OSError as e:
+        logging.getLogger("Hormiguita.Daemon").warning(
+            "No se pudo escribir PID file: %s", e
+        )
+
+
+def _borrar_pid():
+    """Borra el archivo PID al salir."""
+    try:
+        os.remove(PID_PATH)
+    except FileNotFoundError:
+        pass
+
+
+# --- Daemon ------------------------------------------------------------------
+
+class GraphMaintenanceDaemon:
+    """Daemon principal de mantenimiento del grafo."""
+    
+    def __init__(self, logger, max_nodos=MAX_NODOS_POR_CICLO, 
+                 intervalo_horas=INTERVALO_HORAS):
+        self.logger = logger
+        self.max_nodos = max_nodos
+        self.intervalo_horas = intervalo_horas
+        self.running = True
+        self.en_ciclo = False
+        self.solicitud_parada = False
+        self._db_path = None
+        
+        # Configurar signal handlers para graceful shutdown
+        signal.signal(signal.SIGINT, self._signal_handler)
+        signal.signal(signal.SIGTERM, self._signal_handler)
+    
+    def _signal_handler(self, signum, frame):
+        """Maneja señales de shutdown prudente.
+
+        Si está ejecutando un ciclo con transacciones activas en SQLite,
+        espera a que el ciclo termine limpiamente antes de salir para
+        evitar corromper la base de datos o dejar estados inconsistentes.
+        """
+        self.solicitud_parada = True
+        self.running = False
+        if self.en_ciclo:
+            self.logger.info(
+                f"[Daemon] Señal {signum} recibida durante ciclo activo. "
+                "Esperando a que la transacción en curso termine limpiamente..."
+            )
+        else:
+            self.logger.info(f"[Daemon] Señal {signum} recibida, deteniendo daemon limpiamente...")
+    
+    def _get_db_path(self):
+        """Obtiene la ruta de la base de datos."""
+        if self._db_path:
+            return self._db_path
+        from core.paths import resolve_db_path
+        self._db_path = resolve_db_path()
+        return self._db_path
+    
+    def ejecutar_ciclo(self):
+        """Ejecuta un ciclo de mantenimiento del grafo."""
+        db_path = self._get_db_path()
+        
+        if not os.path.exists(db_path):
+            self.logger.error(f"[Daemon] Base de datos no encontrada: {db_path}")
+            return {"resultado": "error", "motivo": "db_no_encontrada"}
+        
+        self.en_ciclo = True
+        cerebro = SQLiteMemoryBioRAG(db_path=db_path)
+        
+        try:
+            self.logger.info("=" * 60)
+            self.logger.info("[Daemon] Iniciando ciclo de mantenimiento del grafo")
+            self.logger.info("=" * 60)
+            
+            # Verificar estado previo
+            estado = _cargar_estado()
+            visitados = len(estado.get("visitados_total", []))
+            frontier = len(estado.get("frontier", []))
+            ciclos = estado.get("ciclos_completados", 0)
+            
+            self.logger.info(
+                f"[Daemon] Estado previo: {visitados} visitados, "
+                f"{frontier} en frontier, {ciclos} ciclos completados"
+            )
+            
+            # Ejecutar ciclo
+            resultado = ejecutar_ciclo_reflexivo(cerebro, max_nodos=self.max_nodos)
+            
+            # Log resultado
+            if resultado.get("resultado") == "quota_agotada":
+                retry_s = resultado.get("retry_after_seconds", 0)
+                retry_h = retry_s / 3600 if retry_s > 0 else self.intervalo_horas
+                self.logger.warning(
+                    f"[Daemon] Quota agotada: {resultado.get('motivo', 'unknown')}. "
+                    f"Próximo intento en {retry_h:.1f}h ({retry_s}s)."
+                )
+            else:
+                self.logger.info(
+                    f"[Daemon] Ciclo completado: "
+                    f"{resultado.get('nodos_procesados', 0)} nodos procesados, "
+                    f"{resultado.get('eliminados_total', 0)} eliminados, "
+                    f"{resultado.get('prefiltrados', 0)} pre-filtrados, "
+                    f"frontier: {resultado.get('frontier_restante', 0)}"
+                )
+            
+            return resultado
+            
+        except Exception as e:
+            self.logger.error(f"[Daemon] Error en ciclo: {e}", exc_info=True)
+            return {"resultado": "error", "motivo": str(e)}
+        finally:
+            try:
+                cerebro.cerrar_sistema()
+            except Exception:
+                pass
+            self.en_ciclo = False
+    
+    def ejecutar_once(self):
+        """Ejecuta un solo ciclo y retorna."""
+        self.logger.info("[Daemon] Modo --once: ejecutando un solo ciclo")
+        resultado = self.ejecutar_ciclo()
+        self.logger.info(f"[Daemon] Resultado: {json.dumps(resultado, indent=2, default=str)}")
+        return resultado
+    
+    def ver_estado(self):
+        """Muestra el estado actual de la hormiguita."""
+        estado = _cargar_estado()
+        
+        print("=" * 60)
+        print("🦟 ESTADO DE LA HORMIGUITA")
+        print("=" * 60)
+        print(f"Ciclos completados: {estado.get('ciclos_completados', 0)}")
+        print(f"Nodo actual: {estado.get('nodo_actual', 'Ninguno')}")
+        print(f"Fase actual: {estado.get('fase_actual', 'N/A')}")
+        print(f"Visitados hoy: {len(estado.get('visitados_hoy', []))}")
+        print(f"Visitados total: {len(estado.get('visitados_total', []))}")
+        print(f"Frontier pendiente: {len(estado.get('frontier', []))}")
+        print(f"Tokens gastados hoy: {estado.get('tokens_gastados_hoy', 0)}")
+        
+        if estado.get("frontier"):
+            print(f"\nFrontier (primeros 10):")
+            for i, nodo in enumerate(estado["frontier"][:10]):
+                print(f"  {i+1}. {nodo}")
+        
+        if estado.get("historial"):
+            print(f"\nÚltimos 5 ciclos:")
+            for registro in estado["historial"][-5:]:
+                ts = datetime.fromtimestamp(registro.get("timestamp", 0)).strftime("%Y-%m-%d %H:%M")
+                resultado = registro.get("resultado", "N/A")
+                print(f"  [{ts}] {resultado}")
+        
+        print("=" * 60)
+    
+    def reset_estado(self):
+        """Resetea el estado de la hormiguita."""
+        estado = {
+            "frontier": [],
+            "visitados_hoy": [],
+            "visitados_total": [],
+            "fase_actual": "urgente",
+            "ciclos_completados": 0,
+            "historial": [],
+            "tokens_gastados_hoy": 0,
+            "nodo_actual": None,
+        }
+        _guardar_estado(estado)
+        self.logger.info("[Daemon] Estado reseteado")
+        print("Estado reseteado correctamente.")
+    
+    def ejecutar_daemon(self):
+        """Ejecuta el daemon en modo continuo."""
+        import atexit
+        
+        # Escribir PID file al arrancar el loop
+        _escribir_pid()
+        atexit.register(_borrar_pid)
+        
+        self.logger.info(
+            f"[Daemon] Iniciando daemon (PID: {os.getpid()}, "
+            f"intervalo: {self.intervalo_horas}h, "
+            f"max_nodos: {self.max_nodos})"
+        )
+        
+        while self.running:
+            # Ejecutar ciclo
+            resultado = self.ejecutar_ciclo()
+            
+            if not self.running:
+                break
+            
+            # Modo "hasta morir" (intervalo=0): sin sleep entre ciclos,
+            # retry cuando quota se agota, esperar 2 días cuando grafo completo
+            if self.intervalo_horas == 0:
+                if resultado.get("resultado") == "quota_agotada":
+                    retry_seconds = resultado.get("retry_after_seconds", 0)
+                    if retry_seconds > 0:
+                        espera_segundos = retry_seconds
+                        horas = retry_seconds / 3600
+                        self.logger.info(
+                            f"[Daemon] Quota agotada. Reintentando en {horas:.1f}h "
+                            f"({retry_seconds}s) — cuando renueve la primera key."
+                        )
+                    else:
+                        retry_min = int(os.environ.get("BIORAG_DAEMON_QUOTA_RETRY_MINUTES", "30"))
+                        espera_segundos = retry_min * 60
+                        self.logger.info(
+                            f"[Daemon] Quota agotada. Reintentando en {retry_min} min..."
+                        )
+                elif resultado.get("nodos_procesados", 0) == 0 and resultado.get("frontier_restante", 0) == 0:
+                    # Grafo completo: todos los nodos visitados, frontier vacía
+                    dias_espera = int(os.environ.get("BIORAG_DAEMON_GRAFO_COMPLETO_ESPERA_DIAS", "2"))
+                    espera_segundos = dias_espera * 86400
+                    self.logger.info(
+                        f"[Daemon] Grafo completo (0 nodos, 0 frontier). "
+                        f"Esperando {dias_espera} días antes de reintentar..."
+                    )
+                else:
+                    # Ciclo OK con trabajo → continuar inmediatamente sin esperar
+                    continue
+            else:
+                # Modo normal: esperar intervalo entre ciclos
+                if resultado.get("resultado") == "quota_agotada":
+                    espera_segundos = min(3600, self.intervalo_horas * 3600)
+                    self.logger.info(
+                        f"[Daemon] Esperando {espera_segundos/3600:.1f}h (quota agotada)"
+                    )
+                else:
+                    espera_segundos = self.intervalo_horas * 3600
+                    self.logger.info(
+                        f"[Daemon] Esperando {self.intervalo_horas}h para próximo ciclo"
+                    )
+            
+            # Espera interruptible
+            inicio_espera = time.time()
+            while self.running and (time.time() - inicio_espera) < espera_segundos:
+                time.sleep(1)  # Check cada segundo para graceful shutdown
+        
+        self.logger.info("[Daemon] Daemon detenido")
+
+
+# --- CLI ---------------------------------------------------------------------
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="BioRAG Graph Maintenance Daemon — La Hormiguita como servicio"
+    )
+    parser.add_argument(
+        "--once", action="store_true",
+        help="Ejecutar un solo ciclo y salir"
+    )
+    parser.add_argument(
+        "--status", action="store_true",
+        help="Ver estado actual de la hormiguita"
+    )
+    parser.add_argument(
+        "--reset", action="store_true",
+        help="Resetear estado de la hormiguita"
+    )
+    parser.add_argument(
+        "--stop", action="store_true",
+        help="Detener el daemon en ejecución"
+    )
+    parser.add_argument(
+        "--force", action="store_true",
+        help="Forzar arranque del daemon continuo ignorando BIORAG_DAEMON_ENABLED=0"
+    )
+    parser.add_argument(
+        "--max-nodos", type=int, default=MAX_NODOS_POR_CICLO,
+        help=f"Máximo de nodos por ciclo (default: {MAX_NODOS_POR_CICLO})"
+    )
+    parser.add_argument(
+        "--intervalo", type=float, default=INTERVALO_HORAS,
+        help=f"Intervalo entre ciclos en horas (default: {INTERVALO_HORAS})"
+    )
+    
+    args = parser.parse_args()
+    
+    # Configurar logging
+    logger = configurar_logging(LOG_DIR)
+    
+    # Crear daemon
+    daemon = GraphMaintenanceDaemon(
+        logger=logger,
+        max_nodos=args.max_nodos,
+        intervalo_horas=args.intervalo,
+    )
+    
+    # Modo status
+    if args.status:
+        daemon.ver_estado()
+        return
+    
+    # Modo reset
+    if args.reset:
+        daemon.reset_estado()
+        return
+
+    # Modo stop
+    if args.stop:
+        from core.daemon_lifecycle import stop_daemon
+        detenido = stop_daemon()
+        if detenido:
+            print("✓ Daemon de La Hormiguita detenido correctamente.")
+        else:
+            print("ℹ No se encontró ninguna instancia del daemon en ejecución.")
+        return
+
+    # Invariante: por defecto el daemon continuo está apagado (BIORAG_DAEMON_ENABLED=0).
+    # Solo corre si BIORAG_DAEMON_ENABLED=1, o con --force, o con --once.
+    daemon_enabled = os.environ.get("BIORAG_DAEMON_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
+    if not args.once and not daemon_enabled and not args.force:
+        print("ℹ Daemon continuo desactivado por defecto (BIORAG_DAEMON_ENABLED=0).")
+        print("  • Para ejecutar un solo ciclo ahora: python3 graph_maintenance_daemon.py --once")
+        print("  • Para activar el daemon continuo:   BIORAG_DAEMON_ENABLED=1 python3 graph_maintenance_daemon.py")
+        print("  • O bien fuerza el arranque con:     python3 graph_maintenance_daemon.py --force")
+        return
+
+    # Adquirir lock
+    lock = DaemonLock(LOCK_PATH)
+    if not lock.adquirir():
+        logger.error("[Daemon] Ya hay una instancia corriendo (lock file presente)")
+        print("ERROR: Ya hay una instancia del daemon corriendo.")
+        print("NO borres el lock file: el flock es la protección contra duplicados.")
+        sys.exit(1)
+    
+    try:
+        if args.once:
+            daemon.ejecutar_once()
+        else:
+            daemon.ejecutar_daemon()
+    finally:
+        lock.liberar()
+        _borrar_pid()
+
+
+if __name__ == "__main__":
+    main()

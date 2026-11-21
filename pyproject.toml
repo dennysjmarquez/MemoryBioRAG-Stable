@@ -1,0 +1,68 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "memory-biorag"
+version = "1.0.0"
+description = "Persistent cognitive memory for AI agents"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Apache-2.0" }
+authors = [
+    { name = "Dennys José Márquez Reyes" }
+]
+keywords = [
+    "memory",
+    "biorag",
+    "ai-agents",
+    "cognitive-architecture",
+    "mcp",
+    "retrieval",
+    "sqlite-fts5",
+    "kanerva-sdm"
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence"
+]
+dependencies = [
+    "numpy==2.4.6",
+    "pydantic==2.13.5",
+    "nltk==3.9.4",
+    "mcp==1.30.0",
+    "python-dotenv==1.2.3",
+    "fastapi==0.141.1",
+    "uvicorn==0.52.4"
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0"
+]
+
+[project.scripts]
+biorag = "biorag:main"
+biorag-mcp = "mcp_server:main"
+
+[tool.setuptools]
+py-modules = ["biorag", "mcp_server", "install", "graph_maintenance_daemon"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["core*", "db*"]
+
+[tool.pytest.ini_options]
+# pythonpath agrega la raíz del proyecto a sys.path automáticamente.
+# Esto permite que `import core` funcione sin exportar PYTHONPATH manualmente.
+pythonpath = ["."]
+testpaths = ["tests"]
+
+[tool.setuptools.package-data]
+db = ["hebbian_clusters.json"]
